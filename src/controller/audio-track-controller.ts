@@ -33,6 +33,8 @@ class AudioTrackController extends BasePlaylistController {
   private trackId: number = -1;
   private currentTrack: MediaPlaylist | null = null;
   private selectDefaultTrack: boolean = true;
+  private explicitTrackSelection: boolean = false;
+  private selectedStableRenditionId: string | undefined;
 
   constructor(hls: Hls) {
     super(hls, 'audio-track-controller');
@@ -68,6 +70,15 @@ class AudioTrackController extends BasePlaylistController {
   }
 
   protected onManifestLoading(): void {
+    // Carry an explicit audio track selection over to the next manifest
+    // so it can be restored when a rendition with the same
+    // STABLE-RENDITION-ID is present
+    const currentTrack = this.currentTrack;
+    this.selectedStableRenditionId =
+      this.explicitTrackSelection && currentTrack
+        ? currentTrack.attrs['STABLE-RENDITION-ID']
+        : undefined;
+    this.explicitTrackSelection = false;
     this.tracks = [];
     this.tracksInGroup = [];
     this.groupIds = null;
@@ -179,8 +190,13 @@ class AudioTrackController extends BasePlaylistController {
         }
       }
 
-      // Select initial track
-      let trackId = this.findTrackId(currentTrack);
+      // Select initial track, first restoring an explicit selection made
+      // before this manifest was (re)loaded when a rendition with the same
+      // STABLE-RENDITION-ID is present
+      let trackId = this.findRestoredTrackId(audioTracks);
+      if (trackId === -1) {
+        trackId = this.findTrackId(currentTrack);
+      }
       if (trackId === -1 && currentTrack) {
         trackId = this.findTrackId(null);
       }
@@ -244,6 +260,7 @@ class AudioTrackController extends BasePlaylistController {
   set audioTrack(newId: number) {
     // If audio track is selected from API then don't choose from the manifest default track
     this.selectDefaultTrack = false;
+    this.explicitTrackSelection = true;
     this.setAudioTrack(newId);
   }
 
@@ -254,6 +271,7 @@ class AudioTrackController extends BasePlaylistController {
   set nextAudioTrack(newId: number) {
     // If audio track is selected from API then don't choose from the manifest default track
     this.selectDefaultTrack = false;
+    this.explicitTrackSelection = true;
     this.setAudioTrack(newId, false);
   }
 
@@ -265,6 +283,7 @@ class AudioTrackController extends BasePlaylistController {
     if (audioOption) {
       const allAudioTracks = this.allAudioTracks;
       this.selectDefaultTrack = false;
+      this.explicitTrackSelection = true;
       if (allAudioTracks.length) {
         // First see if current option matches (no switch op)
         const currentTrack = this.currentTrack;
@@ -358,6 +377,27 @@ class AudioTrackController extends BasePlaylistController {
       track.details,
     );
     this.loadPlaylist(hlsUrlParameters);
+  }
+
+  private findRestoredTrackId(audioTracks: MediaPlaylist[]): number {
+    const stableRenditionId = this.selectedStableRenditionId;
+    this.selectedStableRenditionId = undefined;
+    if (!stableRenditionId) {
+      return -1;
+    }
+    const trackId = audioTracks.findIndex(
+      (track) => track.attrs['STABLE-RENDITION-ID'] === stableRenditionId,
+    );
+    if (trackId > -1) {
+      // Keep the restored selection explicit so that it is carried over to
+      // the next manifest reload and not overridden by the default track
+      this.selectDefaultTrack = false;
+      this.explicitTrackSelection = true;
+      this.log(
+        `Restoring audio selection to track ${trackId} "${audioTracks[trackId].name}" with STABLE-RENDITION-ID "${stableRenditionId}"`,
+      );
+    }
+    return trackId;
   }
 
   private findTrackId(currentTrack: MediaPlaylist | null): number {

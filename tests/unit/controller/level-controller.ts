@@ -20,7 +20,7 @@ import type {
   ManifestLoadedData,
   ManifestParsedData,
 } from '../../../src/types/events';
-import type { HlsUrlParameters } from '../../../src/types/level';
+import type { HlsUrlParameters, LevelParsed } from '../../../src/types/level';
 import type { PlaylistLoaderContext } from '../../../src/types/loader';
 import type {
   MediaAttributes,
@@ -1276,6 +1276,187 @@ segment-2.seg`,
 
       expect(details2.requestScheduled).to.be.eq(stats.loading.start + 6000);
       expect(loadingPlaylist).to.have.been.calledOnce;
+    });
+  });
+
+  describe('Manual level selection across manifest reloads', function () {
+    const manifestUrl = 'http://cdn.example/master.m3u8';
+
+    function variant(
+      stableVariantId: string | undefined,
+      bitrate: number,
+      url: string,
+    ): LevelParsed {
+      const attributes: { [key: string]: string | number } = {
+        BANDWIDTH: bitrate,
+        RESOLUTION: '1280x720',
+      };
+      if (stableVariantId) {
+        attributes['STABLE-VARIANT-ID'] = stableVariantId;
+      }
+      return parsedLevel({
+        attrs: new AttrList(attributes),
+        bitrate,
+        height: 720,
+        width: 1280,
+        name: stableVariantId || `${bitrate}`,
+        url,
+      });
+    }
+
+    function switchManifest(levels: LevelParsed[]) {
+      hls.trigger(Events.MANIFEST_LOADING, { url: manifestUrl });
+      levelController.onManifestLoaded(Events.MANIFEST_LOADED, {
+        audioTracks: [],
+        levels,
+        iframeVariants: [],
+        networkDetails: new Response('ok'),
+        sessionData: null,
+        sessionKeys: null,
+        contentSteering: null,
+        startTimeOffset: null,
+        variableList: null,
+        stats: new LoadStats(),
+        subtitles: [],
+        url: manifestUrl,
+      });
+    }
+
+    function playlistWithStableIds(
+      suffix: string = '',
+      includeTiny: boolean = false,
+    ): LevelParsed[] {
+      const levels = [
+        variant('low', 800000, `http://cdn.example/low.m3u8${suffix}`),
+        variant('mid', 1400000, `http://cdn.example/mid.m3u8${suffix}`),
+        variant('high', 2800000, `http://cdn.example/high.m3u8${suffix}`),
+      ];
+      if (includeTiny) {
+        levels.unshift(
+          variant('tiny', 400000, `http://cdn.example/tiny.m3u8${suffix}`),
+        );
+      }
+      return levels;
+    }
+
+    it('restores a manual level selection locked before a manifest reload by STABLE-VARIANT-ID', function () {
+      switchManifest(playlistWithStableIds());
+      // Lock on mid (1400000)
+      levelController.manualLevel = 1;
+      expect(levelController.manualLevel).to.equal(1);
+
+      // New manifest prepends tiny (400000) and updates variant URLs
+      switchManifest(playlistWithStableIds('?t=2', true));
+
+      // The lock stays on mid (auto selection stays off)
+      expect(levelController.manualLevel).to.equal(2);
+      expect(levelController.startLevel).to.equal(2);
+      expect(levelController.nextLoadLevel).to.equal(2);
+      const levels = levelController.levels as Level[];
+      expect(levels[2].bitrate).to.equal(1400000);
+      expect(levels[2].uri).to.equal('http://cdn.example/mid.m3u8?t=2');
+      expect(levels[2].attrs['STABLE-VARIANT-ID']).to.equal('mid');
+
+      // Startup lands on the restored level
+      hls.nextLoadLevel = levelController.startLevel;
+      expect(levelController.level).to.equal(2);
+      expect(levelController.loadLevelObj?.uri).to.equal(
+        'http://cdn.example/mid.m3u8?t=2',
+      );
+    });
+
+    it('keeps a restored manual selection across further manifest reloads', function () {
+      switchManifest(playlistWithStableIds());
+      levelController.manualLevel = 1;
+
+      switchManifest(playlistWithStableIds('?t=2', true));
+      expect(levelController.manualLevel).to.equal(2);
+
+      switchManifest(playlistWithStableIds('?t=3', true));
+      expect(levelController.manualLevel).to.equal(2);
+      const levels = levelController.levels as Level[];
+      expect(levels[2].uri).to.equal('http://cdn.example/mid.m3u8?t=3');
+    });
+
+    it('releases the manual selection when the locked variant is removed from the manifest', function () {
+      switchManifest(playlistWithStableIds());
+      levelController.manualLevel = 1;
+
+      // New manifest has no mid variant
+      hls.trigger(Events.MANIFEST_LOADING, { url: manifestUrl });
+      levelController.onManifestLoaded(Events.MANIFEST_LOADED, {
+        audioTracks: [],
+        levels: [
+          variant('tiny', 400000, 'http://cdn.example/tiny.m3u8?t=2'),
+          variant('low', 800000, 'http://cdn.example/low.m3u8?t=2'),
+          variant('high', 2800000, 'http://cdn.example/high.m3u8?t=2'),
+        ],
+        iframeVariants: [],
+        networkDetails: new Response('ok'),
+        sessionData: null,
+        sessionKeys: null,
+        contentSteering: null,
+        startTimeOffset: null,
+        variableList: null,
+        stats: new LoadStats(),
+        subtitles: [],
+        url: manifestUrl,
+      });
+
+      // The lock is released and startup falls back to the lowest bitrate level
+      expect(levelController.manualLevel).to.equal(-1);
+      (hls as any).firstAutoLevel = 0;
+      expect(levelController.startLevel).to.equal(0);
+      const levels = levelController.levels as Level[];
+      expect(levels[0].bitrate).to.equal(400000);
+      expect(levels[0].uri).to.equal('http://cdn.example/tiny.m3u8?t=2');
+    });
+
+    it('releases the manual selection when variants have no STABLE-VARIANT-ID', function () {
+      switchManifest([
+        variant(undefined, 800000, 'http://cdn.example/low.m3u8'),
+        variant(undefined, 1400000, 'http://cdn.example/mid.m3u8'),
+        variant(undefined, 2800000, 'http://cdn.example/high.m3u8'),
+      ]);
+      // Lock on the 1400000 variant
+      levelController.manualLevel = 1;
+
+      // New manifest prepends a 400000 variant and updates variant URLs
+      switchManifest([
+        variant(undefined, 400000, 'http://cdn.example/tiny.m3u8?t=2'),
+        variant(undefined, 800000, 'http://cdn.example/low.m3u8?t=2'),
+        variant(undefined, 1400000, 'http://cdn.example/mid.m3u8?t=2'),
+        variant(undefined, 2800000, 'http://cdn.example/high.m3u8?t=2'),
+      ]);
+
+      // The lock is released: the 800000 variant now at index 1 is not
+      // treated as the locked one, and startup falls back to 400000
+      expect(levelController.manualLevel).to.equal(-1);
+      (hls as any).firstAutoLevel = 0;
+      expect(levelController.startLevel).to.equal(0);
+      const levels = levelController.levels as Level[];
+      expect(levels[0].bitrate).to.equal(400000);
+      expect(levels[1].bitrate).to.equal(800000);
+    });
+
+    it('does not restore a selection that was released before the manifest reload', function () {
+      switchManifest(playlistWithStableIds());
+      levelController.manualLevel = 1;
+      levelController.manualLevel = -1;
+
+      switchManifest(playlistWithStableIds('?t=2', true));
+
+      expect(levelController.manualLevel).to.equal(-1);
+    });
+
+    it('starts on the lowest bitrate level on first open without a manual selection', function () {
+      (hls as any).firstAutoLevel = 0;
+      switchManifest(playlistWithStableIds('?t=2', true));
+
+      expect(levelController.manualLevel).to.equal(-1);
+      expect(levelController.startLevel).to.equal(0);
+      const levels = levelController.levels as Level[];
+      expect(levels[0].bitrate).to.equal(400000);
     });
   });
 });

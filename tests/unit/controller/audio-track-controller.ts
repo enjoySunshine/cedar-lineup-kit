@@ -584,4 +584,170 @@ describe('AudioTrackController', function () {
       );
     });
   });
+
+  describe('Audio track selection across manifest reloads', function () {
+    function audioTrack(
+      name: string,
+      stableRenditionId: string,
+      isDefault: boolean,
+      url: string,
+    ): MediaPlaylist {
+      return {
+        attrs: new AttrList({
+          'GROUP-ID': 'aac',
+          LANGUAGE: 'zh',
+          NAME: name,
+          DEFAULT: isDefault ? 'YES' : 'NO',
+          AUTOSELECT: 'YES',
+          'STABLE-RENDITION-ID': stableRenditionId,
+          URI: url,
+        }) as MediaAttributes,
+        bitrate: 0,
+        autoselect: true,
+        default: isDefault,
+        forced: false,
+        groupId: 'aac',
+        id: 0,
+        name,
+        type: 'AUDIO',
+        url,
+        lang: 'zh',
+      };
+    }
+
+    function reloadManifest(audioTracks: MediaPlaylist[]) {
+      audioTrackController.onManifestLoading();
+      audioTrackController.onManifestParsed(Events.MANIFEST_PARSED, {
+        audioTracks,
+      });
+      audioTrackController.onLevelLoading(Events.LEVEL_LOADING, {
+        level: 0,
+      });
+    }
+
+    beforeEach(function () {
+      hls.levelController = {
+        levels: [
+          {
+            audioGroups: ['aac'],
+          },
+        ],
+      };
+    });
+
+    it('restores an explicit audio selection after a manifest reload by STABLE-RENDITION-ID', function () {
+      audioTrackController.onManifestParsed(Events.MANIFEST_PARSED, {
+        audioTracks: [
+          audioTrack('原声', 'orig', true, 'http://cdn.example/orig.m3u8'),
+          audioTrack('解说', 'comm', false, 'http://cdn.example/comm.m3u8'),
+        ],
+      });
+      audioTrackController.onLevelLoading(Events.LEVEL_LOADING, {
+        level: 0,
+      });
+      expect(audioTrackController.audioTrack).to.equal(0);
+
+      // Select the commentary track (解说)
+      audioTrackController.audioTrack = 1;
+      expect(audioTrackController.audioTrack).to.equal(1);
+
+      // New manifest adds 环境 (amb), renames 解说 to 评述 (still "comm"),
+      // and updates rendition URLs
+      reloadManifest([
+        audioTrack('原声', 'orig', true, 'http://cdn.example/orig.m3u8?t=2'),
+        audioTrack('环境', 'amb', false, 'http://cdn.example/amb.m3u8?t=2'),
+        audioTrack('评述', 'comm', false, 'http://cdn.example/comm.m3u8?t=2'),
+      ]);
+
+      // The renamed 评述 rendition comes out, not the default 原声
+      expect(audioTrackController.audioTrack).to.equal(2);
+      const currentTrack = (audioTrackController as any).currentTrack;
+      expect(currentTrack.name).to.equal('评述');
+      expect(currentTrack.url).to.equal('http://cdn.example/comm.m3u8?t=2');
+      expect(currentTrack.attrs['STABLE-RENDITION-ID']).to.equal('comm');
+    });
+
+    it('keeps a restored audio selection across further manifest reloads', function () {
+      audioTrackController.onManifestParsed(Events.MANIFEST_PARSED, {
+        audioTracks: [
+          audioTrack('原声', 'orig', true, 'http://cdn.example/orig.m3u8'),
+          audioTrack('解说', 'comm', false, 'http://cdn.example/comm.m3u8'),
+        ],
+      });
+      audioTrackController.onLevelLoading(Events.LEVEL_LOADING, {
+        level: 0,
+      });
+      audioTrackController.audioTrack = 1;
+
+      reloadManifest([
+        audioTrack('原声', 'orig', true, 'http://cdn.example/orig.m3u8?t=2'),
+        audioTrack('环境', 'amb', false, 'http://cdn.example/amb.m3u8?t=2'),
+        audioTrack('评述', 'comm', false, 'http://cdn.example/comm.m3u8?t=2'),
+      ]);
+      expect(audioTrackController.audioTrack).to.equal(2);
+
+      reloadManifest([
+        audioTrack('原声', 'orig', true, 'http://cdn.example/orig.m3u8?t=3'),
+        audioTrack('环境', 'amb', false, 'http://cdn.example/amb.m3u8?t=3'),
+        audioTrack('评述', 'comm', false, 'http://cdn.example/comm.m3u8?t=3'),
+      ]);
+      expect(audioTrackController.audioTrack).to.equal(2);
+      const currentTrack = (audioTrackController as any).currentTrack;
+      expect(currentTrack.name).to.equal('评述');
+      expect(currentTrack.url).to.equal('http://cdn.example/comm.m3u8?t=3');
+    });
+
+    it('keeps playing the default track after a manifest reload when no track was selected', function () {
+      audioTrackController.onManifestParsed(Events.MANIFEST_PARSED, {
+        audioTracks: [
+          audioTrack('原声', 'orig', true, 'http://cdn.example/orig.m3u8'),
+          audioTrack('解说', 'comm', false, 'http://cdn.example/comm.m3u8'),
+        ],
+      });
+      audioTrackController.onLevelLoading(Events.LEVEL_LOADING, {
+        level: 0,
+      });
+      // Listening to the default 原声 without ever switching
+      expect(audioTrackController.audioTrack).to.equal(0);
+
+      // New manifest inserts 环境 (amb); 原声 is still the default
+      reloadManifest([
+        audioTrack('原声', 'orig', true, 'http://cdn.example/orig.m3u8?t=2'),
+        audioTrack('环境', 'amb', false, 'http://cdn.example/amb.m3u8?t=2'),
+        audioTrack('评述', 'comm', false, 'http://cdn.example/comm.m3u8?t=2'),
+      ]);
+
+      // 原声 still comes out; 环境 is not selected
+      expect(audioTrackController.audioTrack).to.equal(0);
+      const currentTrack = (audioTrackController as any).currentTrack;
+      expect(currentTrack.name).to.equal('原声');
+      expect(currentTrack.attrs['STABLE-RENDITION-ID']).to.equal('orig');
+    });
+
+    it('falls back to the default track when the selected rendition is removed from the manifest', function () {
+      audioTrackController.onManifestParsed(Events.MANIFEST_PARSED, {
+        audioTracks: [
+          audioTrack('原声', 'orig', true, 'http://cdn.example/orig.m3u8'),
+          audioTrack('解说', 'comm', false, 'http://cdn.example/comm.m3u8'),
+        ],
+      });
+      audioTrackController.onLevelLoading(Events.LEVEL_LOADING, {
+        level: 0,
+      });
+      audioTrackController.audioTrack = 1;
+      expect(audioTrackController.audioTrack).to.equal(1);
+
+      // New manifest no longer includes the "comm" rendition
+      reloadManifest([
+        audioTrack('原声', 'orig', true, 'http://cdn.example/orig.m3u8?t=2'),
+        audioTrack('环境', 'amb', false, 'http://cdn.example/amb.m3u8?t=2'),
+      ]);
+
+      // The default 原声 comes out
+      expect(audioTrackController.audioTrack).to.equal(0);
+      const currentTrack = (audioTrackController as any).currentTrack;
+      expect(currentTrack.name).to.equal('原声');
+      expect(currentTrack.attrs['STABLE-RENDITION-ID']).to.equal('orig');
+    });
+  });
 });

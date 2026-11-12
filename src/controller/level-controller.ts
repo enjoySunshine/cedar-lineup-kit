@@ -36,6 +36,7 @@ export default class LevelController extends BasePlaylistController {
   private currentLevel: Level | null = null;
   private currentLevelIndex: number = -1;
   private manualLevelIndex: number = -1;
+  private manualLevelStableVariantId: string | undefined;
   private steering: ContentSteeringController | null;
   private lastABRSwitchTime: number = -1;
 
@@ -92,6 +93,13 @@ export default class LevelController extends BasePlaylistController {
   }
 
   private resetLevels() {
+    // Carry a manual (non-ABR) level selection over to the next manifest
+    // so it can be restored when a variant with the same STABLE-VARIANT-ID
+    // is present
+    const manualLevel = this._levels[this.manualLevelIndex];
+    this.manualLevelStableVariantId = manualLevel
+      ? manualLevel.attrs['STABLE-VARIANT-ID']
+      : undefined;
     this._startLevel = undefined;
     this.manualLevelIndex = -1;
     this.currentLevelIndex = -1;
@@ -330,6 +338,27 @@ export default class LevelController extends BasePlaylistController {
     }
 
     this._levels = levels;
+
+    // Restore a manual level selection made before this manifest was
+    // (re)loaded when a variant with the same STABLE-VARIANT-ID is present.
+    // Otherwise the selection is released and startup falls back to auto
+    // level selection.
+    const stableVariantId = this.manualLevelStableVariantId;
+    this.manualLevelStableVariantId = undefined;
+    if (stableVariantId) {
+      const restoredLevelIndex = levels.findIndex(
+        (level) => level.attrs['STABLE-VARIANT-ID'] === stableVariantId,
+      );
+      if (restoredLevelIndex > -1) {
+        this.log(
+          `Restoring manual level selection to level ${restoredLevelIndex} with STABLE-VARIANT-ID "${stableVariantId}"`,
+        );
+        this.manualLevelIndex = restoredLevelIndex;
+        if (this._startLevel === undefined) {
+          this._startLevel = restoredLevelIndex;
+        }
+      }
+    }
 
     // find index of first level in sorted levels
     for (let i = 0; i < levels.length; i++) {
